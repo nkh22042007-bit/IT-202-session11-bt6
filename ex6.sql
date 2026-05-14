@@ -1,22 +1,10 @@
-CREATE DATABASE ex6;
-use ex6;
+USE RikkeiClinicDB;
 
-
-CREATE TABLE Medicines (
-    medicine_id INT PRIMARY KEY,
-    name VARCHAR(100),
-    price DECIMAL(15, 2),
-    stock INT
-);
-
-CREATE TABLE Patient_Invoices (
-    patient_id INT PRIMARY KEY,
-    total_due DECIMAL(15, 2) DEFAULT 0
-);
-
--- Dữ liệu mẫu
-INSERT INTO Medicines VALUES (1, 'Paracetamol', 10000, 50);
-INSERT INTO Patient_Invoices (patient_id, total_due) VALUES (101, 0);
+-- =============================================================
+-- 1. STORED PROCEDURE: ProcessPrescription
+-- Nhiệm vụ: Tự động hóa kiểm tra kho, tính tiền, giảm giá và cộng nợ
+-- =============================================================
+DROP PROCEDURE IF EXISTS ProcessPrescription;
 
 DELIMITER //
 
@@ -25,57 +13,73 @@ CREATE PROCEDURE ProcessPrescription(
     IN p_medicine_id INT,
     IN p_quantity INT,
     IN p_discount_code VARCHAR(20),
-    OUT p_status_msg VARCHAR(255)
+    OUT p_message VARCHAR(255)
 )
 BEGIN
     DECLARE v_stock INT;
-    DECLARE v_unit_price DECIMAL(15, 2);
-    DECLARE v_final_price DECIMAL(15, 2);
+    DECLARE v_price DECIMAL(18,2);
+    DECLARE v_total_amount DECIMAL(18,2);
 
-    -- Lấy thông tin thuốc
-    SELECT stock, price INTO v_stock, v_unit_price 
-    FROM Medicines WHERE medicine_id = p_medicine_id;
+    -- Bước 1: Lấy thông tin thuốc (Giá và Tồn kho)
+    SELECT stock, price INTO v_stock, v_price 
+    FROM Medicines 
+    WHERE medicine_id = p_medicine_id;
 
-    -- 1. Bẫy Out of stock
-    IF v_stock < p_quantity THEN
-        SET p_status_msg = 'Thất bại: Kho không đủ thuốc';
+    -- Bước 2: Kiểm tra ràng buộc Out of Stock (Ràng buộc mục 3 trong ảnh)
+    IF v_stock IS NULL THEN
+        SET p_message = 'Thất bại: Thuốc không tồn tại';
+    ELSEIF v_stock < p_quantity THEN
+        SET p_message = 'Thất bại: Kho không đủ thuốc';
     ELSE
-        -- 2. Tính toán tiền và áp dụng mã giảm giá
+        -- Bước 3: Tính thành tiền = Số lượng * Đơn giá
+        SET v_total_amount = v_price * p_quantity;
+
+        -- Bước 4: Áp dụng chính sách trợ giá (Ràng buộc mục 2 trong ảnh)
+        -- Mã 'NV-RIKKEI' giảm 50%, các mã khác hoặc NULL tính giá gốc
         IF p_discount_code = 'NV-RIKKEI' THEN
-            SET v_final_price = (p_quantity * v_unit_price) * 0.5;
-        ELSE
-            SET v_final_price = (p_quantity * v_unit_price);
+            SET v_total_amount = v_total_amount * 0.5;
         END IF;
 
-        -- 3. Thực hiện cập nhật dữ liệu
-        START TRANSACTION;
-            -- Trừ kho
-            UPDATE Medicines 
-            SET stock = stock - p_quantity 
-            WHERE medicine_id = p_medicine_id;
+        -- Bước 5: Cập nhật Database (Thực hiện giao dịch)
+        -- 5.1. Trừ số lượng thuốc trong kho
+        UPDATE Medicines 
+        SET stock = stock - p_quantity 
+        WHERE medicine_id = p_medicine_id;
 
-            -- Cộng dồn nợ cho bệnh nhân
-            UPDATE Patient_Invoices 
-            SET total_due = total_due + v_final_price 
-            WHERE patient_id = p_patient_id;
-        COMMIT;
+        -- 5.2. Cộng dồn vào "Tổng nợ" (total_due) của bệnh nhân
+        UPDATE Patient_Invoices 
+        SET total_due = total_due + v_total_amount,
+            last_updated = CURRENT_TIMESTAMP
+        WHERE patient_id = p_patient_id;
 
-        SET p_status_msg = 'Thành công: Đã xử lý đơn thuốc';
+        -- Bước 6: Trả về thông báo thành công
+        SET p_message = 'Thành công: Đã xử lý đơn thuốc';
     END IF;
 END //
 
 DELIMITER ;
 
-SET @msg = '';
 
--- (1) Kê đơn bình thường, không mã giảm giá
-CALL ProcessPrescription(101, 1, 2, NULL, @msg);
-SELECT @msg; -- Mong đợi: Thành công, cộng 20.000 vào nợ.
+-- =============================================================
+-- 2. KỊCH BẢN KIỂM THỬ (TEST CASES) - Theo mục 4 trong ảnh
+-- =============================================================
 
--- (2) Kê đơn có mã giảm giá NV-RIKKEI
-CALL ProcessPrescription(101, 1, 2, 'NV-RIKKEI', @msg);
-SELECT @msg; -- Mong đợi: Thành công, cộng 10.000 vào nợ.
+-- Kịch bản 1: Kê đơn bình thường, không có mã giảm giá
+-- Bệnh nhân 1 mua 2 Amoxicillin (15.000 * 2 = 30.000)
+CALL ProcessPrescription(1, 1, 2, NULL, @msg1);
+SELECT @msg1 AS 'Status_Case_1', total_due FROM Patient_Invoices WHERE patient_id = 1;
 
--- (3) Kê đơn vượt quá số lượng tồn kho (Bẫy lỗi)
-CALL ProcessPrescription(101, 1, 100, NULL, @msg);
-SELECT @msg; -- Mong đợi: Thất bại: Kho không đủ thuốc.
+
+-- Kịch bản 2: Kê đơn có mã giảm giá 'NV-RIKKEI'
+-- Bệnh nhân 2 mua 1 Amoxicillin (15.000 * 1 * 50% = 7.500)
+CALL ProcessPrescription(2, 1, 1, 'NV-RIKKEI', @msg2);
+SELECT @msg2 AS 'Status_Case_2', total_due FROM Patient_Invoices WHERE patient_id = 2;
+
+
+-- Kịch bản 3: Kê đơn vượt quá số lượng tồn kho (Lỗi Out of Stock)
+-- Thuốc Panadol (ID=2) chỉ còn 5 sản phẩm, yêu cầu mua 10
+CALL ProcessPrescription(3, 2, 10, NULL, @msg3);
+SELECT @msg3 AS 'Status_Case_3';
+
+-- Xem lại bảng Thuốc sau khi đã trừ kho
+SELECT * FROM Medicines;
